@@ -3,7 +3,7 @@
 <head>
     <meta name="google-site-verification" content="LRfJw4wb98mZXFN-3wHpyiaPpULFPf_kEO5_FcrWzqs" />
     <meta charset="UTF-8">
-    <title>War Thunder Web - MULTIPLAYER TEAMS (FIXED)</title>
+    <title>War Thunder Web - MULTIPLAYER TEAMS (FULL SYNC)</title>
     <style>
         body { margin: 0; overflow: hidden; background: #0f172a; font-family: 'Segoe UI', sans-serif; user-select: none; }
         
@@ -539,14 +539,8 @@ function setupDataChannel(channel, targetId) {
         } else if (data.type === 'shoot') {
             fireRemote(targetId);
         } else if (data.type === 'hit') {
-            if (!playerTank.isDestroyed && !playerTank.isProtected) {
-                applyDamageToPlayer(data.damage, targetId);
-            }
-        } else if (data.type === 'respawn') {
-            if (remoteTanks[targetId]) {
-                const color = remoteTanks[targetId].team === 'blue' ? 0x2563eb : 0xef4444;
-                resetTank(remoteTanks[targetId], color);
-                activateShield(remoteTanks[targetId]);
+            if (playerTank && !playerTank.isDestroyed && !playerTank.isProtected) {
+                applyDamageToPlayer(data.damage, data.attacker || "Przeciwnik");
             }
         } else if (data.type === 'killBroadcast') {
             addKillFeedMsg(`${data.killer} 💥 ${data.victim}`);
@@ -563,11 +557,28 @@ function updateRemotePlayer(clientId, data) {
         spawnRemotePlayer(clientId, data.team);
     }
     const tank = remoteTanks[clientId];
+    
     if (tank.team !== data.team) {
         tank.team = data.team;
         const colorHex = data.team === 'blue' ? 0x2563eb : 0xef4444;
         resetTank(tank, colorHex);
     }
+
+    tank.hp = (data.hp !== undefined) ? data.hp : tank.hp;
+    tank.isProtected = (data.isProtected !== undefined) ? data.isProtected : tank.isProtected;
+
+    if (data.isDestroyed !== undefined && tank.isDestroyed !== data.isDestroyed) {
+        tank.isDestroyed = data.isDestroyed;
+        if (tank.isDestroyed) {
+            tank.mesh.traverse(c => { 
+                if(c.isMesh) c.material = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.95 }); 
+            });
+        } else {
+            const colorHex = tank.team === 'blue' ? 0x2563eb : 0xef4444;
+            resetTank(tank, colorHex);
+        }
+    }
+
     tank.mesh.position.set(data.x, data.y, data.z);
     tank.mesh.rotation.y = data.rotation;
     tank.turretPivot.rotation.y = data.turretRotation;
@@ -598,6 +609,7 @@ function removeRemotePlayer(clientId) {
 }
 
 function sendMyPosition() {
+    if (!playerTank) return;
     const payload = JSON.stringify({
         type: 'move',
         team: myTeam,
@@ -606,7 +618,10 @@ function sendMyPosition() {
         z: playerTank.mesh.position.z,
         rotation: playerTank.mesh.rotation.y,
         turretRotation: playerTank.turretPivot.rotation.y,
-        gunRotation: playerTank.gunPivot.rotation.x
+        gunRotation: playerTank.gunPivot.rotation.x,
+        hp: playerTank.hp,
+        isDestroyed: playerTank.isDestroyed,
+        isProtected: playerTank.isProtected
     });
 
     Object.keys(peerConnections).forEach(id => {
@@ -629,6 +644,7 @@ function sendMyShot() {
 
 function activateShield(tank) {
     tank.isProtected = true;
+    sendMyPosition();
     
     if (tank === playerTank) {
         const ind = document.getElementById('shield-indicator');
@@ -645,6 +661,7 @@ function activateShield(tank) {
                 clearInterval(tank.shieldInterval);
                 tank.isProtected = false;
                 ind.style.display = 'none';
+                sendMyPosition();
             }
         }, 1000);
     } else {
@@ -654,10 +671,12 @@ function activateShield(tank) {
     }
 }
 
-function applyDamageToPlayer(damage, attackerName = "Bot") {
-    if (playerTank.isDestroyed || playerTank.isProtected) return;
+function applyDamageToPlayer(damage, attackerName = "Gracz") {
+    if (!playerTank || playerTank.isDestroyed || playerTank.isProtected) return;
 
     playerTank.hp -= damage;
+    if (playerTank.hp < 0) playerTank.hp = 0;
+
     const hpEl = document.getElementById('player-hp');
     hpEl.innerText = `${playerTank.hp} / 3`;
     hpEl.style.color = playerTank.hp === 2 ? '#f59e0b' : '#ef4444';
@@ -670,11 +689,21 @@ function applyDamageToPlayer(damage, attackerName = "Bot") {
         
         addKillFeedMsg(`${attackerName} 💥 ${myClientId || 'Ty'}`);
 
+        const broadcast = JSON.stringify({ type: 'killBroadcast', killer: attackerName, victim: myClientId || 'Ty' });
+        Object.keys(peerConnections).forEach(id => {
+            const pc = peerConnections[id];
+            if (pc && pc.dataChannel && pc.dataChannel.readyState === 'open') {
+                pc.dataChannel.send(broadcast);
+            }
+        });
+
         setTimeout(() => {
             document.getElementById('death-stats').innerText = `Zabójstwa: ${myKills}`;
             document.getElementById('death-overlay').style.display = 'flex';
         }, 400);
     }
+
+    sendMyPosition();
 }
 
 function resetTank(tankObj, colorHex) {
@@ -739,6 +768,8 @@ function startGame(multiplayerMode = false) {
     document.getElementById('txt-player-title').innerText = `GRACZ (TY - ${myTeam === 'blue' ? 'NIEBIESCY' : 'CZERWONI'})`;
     document.getElementById('txt-player-title').style.color = myTeam === 'blue' ? '#3b82f6' : '#ef4444';
 
+    sendMyPosition();
+
     lastTime = performance.now();
     animate(performance.now());
 }
@@ -772,13 +803,8 @@ function restartGame() {
 
     if (isMultiplayer) {
         activateShield(playerTank);
-        const payload = JSON.stringify({ type: 'respawn' });
-        Object.keys(peerConnections).forEach(id => {
-            const pc = peerConnections[id];
-            if (pc.dataChannel && pc.dataChannel.readyState === 'open') {
-                pc.dataChannel.send(payload);
-            }
-        });
+    } else {
+        sendMyPosition();
     }
 
     gameActive = true;
@@ -1401,45 +1427,32 @@ function animate(currentTime) {
                 } else {
                     if (target === playerTank) {
                         applyDamageToPlayer(1, b.owner.isBot ? "Bot" : (b.owner.clientId || "Gracz"));
-                    } else {
+                    } else if (target.isBot) {
                         target.hp -= 1;
-
-                        if (isMultiplayer && b.owner === playerTank) {
-                            Object.keys(remoteTanks).forEach(remoteId => {
-                                if (remoteTanks[remoteId] === target) {
-                                    const pc = peerConnections[remoteId];
-                                    if (pc && pc.dataChannel && pc.dataChannel.readyState === 'open') {
-                                        pc.dataChannel.send(JSON.stringify({ type: 'hit', damage: 1 }));
-                                    }
-                                }
-                            });
-                        }
-
                         if (b.owner === playerTank) {
                             xrayEl.innerHTML = `<b style='color:#ef4444'>${t.pen}</b><br>HP: ${target.hp}/3`;
                         }
-
                         if (target.hp <= 0) {
                             target.isDestroyed = true;
                             target.mesh.traverse(c => { 
                                 if(c.isMesh) c.material = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.95 }); 
                             });
-                            
                             if (b.owner === playerTank) {
                                 myKills++;
-                                const victimName = target.isBot ? "Bot" : (target.clientId || "Gracz");
-                                addKillFeedMsg(`${myClientId || 'Ty'} 💥 ${victimName}`);
-
-                                if (isMultiplayer) {
-                                    const broadcast = JSON.stringify({ type: 'killBroadcast', killer: myClientId || 'Ty', victim: victimName });
-                                    Object.keys(peerConnections).forEach(id => {
-                                        const pc = peerConnections[id];
-                                        if (pc && pc.dataChannel && pc.dataChannel.readyState === 'open') {
-                                            pc.dataChannel.send(broadcast);
-                                        }
-                                    });
-                                }
+                                addKillFeedMsg(`${myClientId || 'Ty'} 💥 Bot`);
                             }
+                        }
+                    } else if (isMultiplayer && b.owner === playerTank) {
+                        if (!target.isProtected && !target.isDestroyed) {
+                            xrayEl.innerHTML = `<b style='color:#ef4444'>${t.pen}</b><br>TRAFIENIE!`;
+                            Object.keys(remoteTanks).forEach(remoteId => {
+                                if (remoteTanks[remoteId] === target) {
+                                    const pc = peerConnections[remoteId];
+                                    if (pc && pc.dataChannel && pc.dataChannel.readyState === 'open') {
+                                        pc.dataChannel.send(JSON.stringify({ type: 'hit', damage: 1, attacker: myClientId || 'Ty' }));
+                                    }
+                                }
+                            });
                         }
                     }
                 }
