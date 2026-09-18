@@ -3,7 +3,7 @@
 <head>
     <meta name="google-site-verification" content="LRfJw4wb98mZXFN-3wHpyiaPpULFPf_kEO5_FcrWzqs" />
     <meta charset="UTF-8">
-    <title>War Thunder Web - MULTIPLAYER TEAMS (OPTIMIZED 60HZ)</title>
+    <title>War Thunder Web - MULTIPLAYER TEAMS (FIXED)</title>
     <style>
         body { margin: 0; overflow: hidden; background: #0f172a; font-family: 'Segoe UI', sans-serif; user-select: none; }
         
@@ -298,6 +298,7 @@ let activeRoomId = null;
 let myTeam = 'blue'; 
 const peerConnections = {}; 
 const remoteTanks = {}; 
+const remotePlayerTeams = {}; 
 
 let SCENE, CAMERA, RENDERER;
 let playerTank;
@@ -351,9 +352,12 @@ function updateTeamSelectionButtons() {
     let blueCount = 0;
     let redCount = 0;
 
-    Object.values(remoteTanks).forEach(t => {
-        if (t.team === 'blue') blueCount++;
-        if (t.team === 'red') redCount++;
+    if (myTeam === 'blue') blueCount++;
+    if (myTeam === 'red') redCount++;
+
+    Object.values(remotePlayerTeams).forEach(team => {
+        if (team === 'blue') blueCount++;
+        if (team === 'red') redCount++;
     });
 
     document.getElementById('cnt-blue').innerText = `(${blueCount} graczy)`;
@@ -362,12 +366,26 @@ function updateTeamSelectionButtons() {
     const btnBlue = document.getElementById('btn-team-blue');
     const btnRed = document.getElementById('btn-team-red');
 
-    btnBlue.disabled = (blueCount - redCount >= 1);
-    btnRed.disabled = (redCount - blueCount >= 1);
+    let currentMyTeam = myTeam;
+    let otherBlue = blueCount - (currentMyTeam === 'blue' ? 1 : 0);
+    let otherRed = redCount - (currentMyTeam === 'red' ? 1 : 0);
+
+    btnBlue.disabled = ((otherBlue + 1) - otherRed > 1);
+    btnRed.disabled = ((otherRed + 1) - otherBlue > 1);
 }
 
 function confirmTeam(selectedTeam) {
     myTeam = selectedTeam;
+    updateTeamSelectionButtons();
+
+    Object.keys(peerConnections).forEach(targetId => {
+        ws.send(JSON.stringify({ 
+            type: 'signal', 
+            targetId: targetId, 
+            signalData: { type: 'teamSelect', team: selectedTeam } 
+        }));
+    });
+
     document.getElementById('team-select-overlay').style.display = 'none';
     startGame(true);
 }
@@ -387,6 +405,7 @@ function connectToCloud() {
             isMultiplayer = true;
             myClientId = data.clientId;
             activeRoomId = data.roomId;
+            myTeam = 'blue';
             openTeamSelect();
         }
 
@@ -395,15 +414,29 @@ function connectToCloud() {
             isMultiplayer = true;
             myClientId = data.clientId;
             activeRoomId = data.roomId;
+            myTeam = 'red';
             openTeamSelect();
         }
 
         if (data.type === 'playerJoinedRoom' && isHost) {
             initPeerConnection(data.newClientId, true);
+            ws.send(JSON.stringify({ 
+                type: 'signal', 
+                targetId: data.newClientId, 
+                signalData: { type: 'teamSelect', team: myTeam } 
+            }));
         }
 
         if (data.type === 'signal') {
-            handleSignalData(data.senderId, data.signalData);
+            if (data.signalData && data.signalData.type === 'teamSelect') {
+                remotePlayerTeams[data.senderId] = data.signalData.team;
+                if (remoteTanks[data.senderId]) {
+                    remoteTanks[data.senderId].team = data.signalData.team;
+                }
+                updateTeamSelectionButtons();
+            } else {
+                handleSignalData(data.senderId, data.signalData);
+            }
         }
 
         if (data.type === 'playerLeftRoom') {
@@ -530,7 +563,11 @@ function updateRemotePlayer(clientId, data) {
         spawnRemotePlayer(clientId, data.team);
     }
     const tank = remoteTanks[clientId];
-    tank.team = data.team;
+    if (tank.team !== data.team) {
+        tank.team = data.team;
+        const colorHex = data.team === 'blue' ? 0x2563eb : 0xef4444;
+        resetTank(tank, colorHex);
+    }
     tank.mesh.position.set(data.x, data.y, data.z);
     tank.mesh.rotation.y = data.rotation;
     tank.turretPivot.rotation.y = data.turretRotation;
@@ -544,6 +581,7 @@ function spawnRemotePlayer(clientId, team = 'blue') {
     tank.team = team;
     tank.kills = 0;
     remoteTanks[clientId] = tank;
+    remotePlayerTeams[clientId] = team;
 }
 
 function removeRemotePlayer(clientId) {
@@ -551,10 +589,12 @@ function removeRemotePlayer(clientId) {
         SCENE.remove(remoteTanks[clientId].mesh);
         delete remoteTanks[clientId];
     }
+    delete remotePlayerTeams[clientId];
     if (peerConnections[clientId]) {
         peerConnections[clientId].close();
         delete peerConnections[clientId];
     }
+    updateTeamSelectionButtons();
 }
 
 function sendMyPosition() {
@@ -644,8 +684,9 @@ function resetTank(tankObj, colorHex) {
 
     const armorMat = new THREE.MeshStandardMaterial({ color: colorHex, roughness: 0.4, metalness: 0.5 });
     tankObj.mesh.traverse(c => { 
-        if (c.isMesh && c.name === "body") c.material = armorMat;
-        if (c.isMesh && c.name === "turret") c.material = armorMat;
+        if (c.isMesh && (c.name === "body" || c.name === "turret")) {
+            c.material = armorMat;
+        }
     });
 }
 
@@ -671,10 +712,11 @@ function startGame(multiplayerMode = false) {
 
     const playerColor = myTeam === 'blue' ? 0x2563eb : 0xef4444;
 
-    if (playerTank) {
-        resetTank(playerTank, playerColor);
-    } else {
+    if (!playerTank) {
         spawnPlayer();
+    } else {
+        resetTank(playerTank, playerColor);
+        SCENE.add(playerTank.mesh);
     }
 
     playerTank.team = myTeam;
@@ -716,26 +758,20 @@ function getSafeSpawnPosition(startPos) {
 }
 
 function restartGame() {
-    if (playerTank) {
-        const playerColor = myTeam === 'blue' ? 0x2563eb : 0xef4444;
-        resetTank(playerTank, playerColor);
-        
-        let targetSpawn;
-        if (isMultiplayer) {
-            targetSpawn = myTeam === 'blue' ? SPAWN_BLUE : SPAWN_RED;
-        } else {
-            targetSpawn = new THREE.Vector3(0, 0, 200);
-        }
-        
-        const safePos = getSafeSpawnPosition(targetSpawn);
-        playerTank.mesh.position.copy(safePos);
-
-        if (isMultiplayer) {
-            activateShield(playerTank);
-        }
-    }
+    document.getElementById('death-overlay').style.display = 'none';
     
+    const playerColor = myTeam === 'blue' ? 0x2563eb : 0xef4444;
+    resetTank(playerTank, playerColor);
+    
+    let targetSpawn = isMultiplayer ? (myTeam === 'blue' ? SPAWN_BLUE : SPAWN_RED) : new THREE.Vector3(0, 0, 200);
+    const safePos = getSafeSpawnPosition(targetSpawn);
+    playerTank.mesh.position.copy(safePos);
+
+    document.getElementById('player-hp').innerText = `3 / 3`;
+    document.getElementById('player-hp').style.color = `#22c55e`;
+
     if (isMultiplayer) {
+        activateShield(playerTank);
         const payload = JSON.stringify({ type: 'respawn' });
         Object.keys(peerConnections).forEach(id => {
             const pc = peerConnections[id];
@@ -745,17 +781,18 @@ function restartGame() {
         });
     }
 
-    startGame(isMultiplayer);
+    gameActive = true;
 }
 
 function resetWorld() {
-    if (RENDERER) RENDERER.domElement.remove();
+    if (RENDERER && RENDERER.domElement) RENDERER.domElement.remove();
     bots = [];
     bullets = [];
     obstacleBoxes = [];
     collidableMeshes = [];
     shootableTargets = [];
     groundMesh = null;
+    playerTank = null;
 }
 
 function exitToMainMenu() {
@@ -1097,13 +1134,7 @@ function spawnPlayer() {
     const color = myTeam === 'blue' ? 0x2563eb : 0xef4444;
     playerTank = createTank(color);
     
-    let spawnPoint;
-    if (isMultiplayer) {
-        spawnPoint = myTeam === 'blue' ? SPAWN_BLUE : SPAWN_RED;
-    } else {
-        spawnPoint = new THREE.Vector3(0, 0, 200);
-    }
-
+    let spawnPoint = isMultiplayer ? (myTeam === 'blue' ? SPAWN_BLUE : SPAWN_RED) : new THREE.Vector3(0, 0, 200);
     const safePos = getSafeSpawnPosition(spawnPoint);
     playerTank.mesh.position.copy(safePos);
 }
@@ -1239,12 +1270,10 @@ function animate(currentTime) {
         playerTank.mesh.position.x = THREE.MathUtils.clamp(playerTank.mesh.position.x, -390, 390);
         playerTank.mesh.position.z = THREE.MathUtils.clamp(playerTank.mesh.position.z, -390, 390);
 
-        // BEZPOŚREDNIA POPRAWKA CELOWANIA W NIEBO I DOWOLNY PUNKT:
         if (groundMesh) {
             raycaster.setFromCamera(mouse, CAMERA);
             const intersects = raycaster.intersectObject(groundMesh);
 
-            // Jeśli trafiamy w ziemię, bierzemy punkt trafienia. Jeśli w niebo – bierzemy punkt w dali.
             const targetPoint = (intersects.length > 0) 
                 ? intersects[0].point 
                 : raycaster.ray.at(500, new THREE.Vector3());
@@ -1357,8 +1386,10 @@ function animate(currentTime) {
                 const isTurret = hit.object.name === "turret";
                 const armorValue = isTurret ? target.turretArmor : target.bodyArmor;
 
-                const normal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
-                const impactAngle = normal.angleTo(b.velocity.clone().negate());
+                const normal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld).normalize();
+                const bulletDir = b.velocity.clone().negate().normalize();
+                const impactAngle = normal.angleTo(bulletDir);
+                
                 const effectiveArmor = Math.round(armorValue / Math.max(0.2, Math.abs(Math.cos(impactAngle))));
                 const xrayEl = document.getElementById('xray-info');
                 const t = translations[currentLang];
